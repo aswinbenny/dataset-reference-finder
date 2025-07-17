@@ -89,31 +89,30 @@ class DatasetReferenceExtractor:
         Extract raw text from a PDF file.
         """
         doc = fitz.open(pdf_path)
-        text = " "
+        text = ""
         for page in doc:
             text += page.get_text()
         doc.close()
         return self.clean_text(text)
     
-    def extract_context(self, text, pattern, window=30):
+    def extract_contexts(self, text, article_id, source):
         """
-        Extract context around regex matches from given text.
+        Extract dataset IDs and their context for all known patterns.
 
         Parameters:
-        - text (str): Input document text.
-        - pattern (str): Regex pattern to match.
-        - window (int): Number of words before and after match to include in context.
+        - text (str): Cleaned article text
+        - article_id (str): Article ID for tagging
+        - source (str): 'pdf' or 'xml'
+        - window (int): Number of tokens before/after the match
 
         Returns:
-        - List of dicts with 'match' and 'context' keys.
+        - List of dicts: Each with dataset_id, context, article_id, source, etc.
         """
-        #pattern = sel
+        window = self.context_window  # Number of tokens to include before/after the match
         matches = []
-
-        # Tokenize the full text once
         tokens = text.split()
 
-        # Map character index → token index
+        # Map char index to token index
         char_to_token = {}
         index = 0
         for i, tok in enumerate(tokens):
@@ -122,26 +121,30 @@ class DatasetReferenceExtractor:
                 char_to_token[j] = i
             index += len(tok)
 
-        # Find matches using re.finditer()
-        for match in re.finditer(pattern, text):
-            raw_match = match.group()
-            cleaned_match = re.sub(r'[\s]', '', raw_match)  # Remove spaces inside ID
+        for pattern_type, pattern in self.regex_patterns.items():
+            for match in re.finditer(pattern, text):
+                raw_match = match.group()
+                cleaned_match = re.sub(r'\s+', '', raw_match)  # Remove inner spaces
+                start_char = match.start()
 
-            start_char = match.start()
+                if start_char in char_to_token:
+                    token_index = char_to_token[start_char]
+                    start = max(0, token_index - window)
+                    end = min(len(tokens), token_index + window + 1)
+                    context_window = tokens[start:end]
 
-            if start_char in char_to_token:
-                token_index = char_to_token[start_char]
-                start = max(0, token_index - window)
-                end = min(len(tokens), token_index + window + 1)
-                context_window = tokens[start:end]
-
-                matches.append({
-                    'match': cleaned_match,
-                    'context': ' '.join(context_window)
-                })
+                    matches.append({
+                        'dataset_id': cleaned_match,
+                        'context': ' '.join(context_window),
+                        'pattern_type': pattern_type,
+                        'article_id': article_id,
+                        'source': source,
+                        'start_idx': start_char,
+                        'score': None  # Filled later
+                    })
 
         return matches
-    
+        
     def score_context(self, ctx: str) -> int:
         """
         Score the extracted context using keyword heuristics.
@@ -179,41 +182,61 @@ class DatasetReferenceExtractor:
 
         return score
     
-    def deduplicate_matches(self, matches: list) -> list:
+    def deduplicate_matches(self, matches):
         """
-        For each dataset_id in an article, retain only one match — the highest scored one.
-        If scores are equal, prefer the earliest in the text.
-        """
-        raise NotImplementedError
+        Deduplicate dataset mentions across PDF and XML sources.
 
-    def merge_pdf_xml_matches(self, pdf_matches: list, xml_matches: list) -> list:
+        Parameters:
+        - matches (list of dict): Output from extract_contexts()
+
+        Returns:
+        - List of best-matched dicts after deduplication
         """
-        Combine matches from PDF and XML. If same dataset_id appears in both,
-        decide which context to keep (e.g., prefer XML, or best score).
-        """
-        raise NotImplementedError
+
+        scored = []
+        for m in matches:
+            m['score'] = self.score_context(m['context'])  # Add score
+            scored.append(m)
+
+        # Group by (article_id, dataset_id)
+        grouped = defaultdict(list)
+        for item in scored:
+            key = (item['article_id'], item['dataset_id'])
+            grouped[key].append(item)
+
+        deduped = []
+
+        for key, items in grouped.items():
+            # Sort based on score DESC, start_idx ASC, source preferring XML
+            items.sort(key=lambda x: (
+                -(x['score'] or 0),   # high score first
+                x['start_idx'],       # earlier index
+                0 if x['source'] == 'xml' else 1  # xml preferred
+            ))
+            deduped.append(items[0])  # Best one
+
+        return deduped
 
     # --- MASTER PIPELINE ---
 
     def process_article(self, article_id: str, pdf_path: str = None, xml_path: str = None) -> None:
         """
         Process one article: extract text from available sources, extract context,
-        deduplicate, merge, and append to master results.
+        deduplicate (with scoring and source preference), and append to master results.
 
         Parameters:
         - article_id (str): Unique ID of the article (e.g., filename without extension)
         - pdf_path (str): Path to PDF file (if exists)
         - xml_path (str): Path to XML file (if exists)
         """
-
-        pdf_matches, xml_matches = [], []
+        all_matches = []
 
         # --- 1. Extract from PDF ---
         if pdf_path:
             try:
                 clean_pdf_text = self.extract_text_from_pdf(pdf_path)
-                pdf_matches = self.extract_context(clean_pdf_text, article_id, source="pdf")
-                pdf_matches = self.deduplicate_matches(pdf_matches)
+                pdf_matches = self.extract_contexts(clean_pdf_text, article_id, source="pdf")
+                all_matches.extend(pdf_matches)
             except Exception as e:
                 print(f"[PDF ERROR] Article {article_id}: {e}")
 
@@ -221,18 +244,17 @@ class DatasetReferenceExtractor:
         if xml_path:
             try:
                 clean_xml_text = self.extract_text_from_xml(xml_path)
-                xml_matches = self.extract_context(clean_xml_text, article_id, source="xml")
-                xml_matches = self.deduplicate_matches(xml_matches)
+                xml_matches = self.extract_contexts(clean_xml_text, article_id, source="xml")
+                all_matches.extend(xml_matches)
             except Exception as e:
                 print(f"[XML ERROR] Article {article_id}: {e}")
 
-        # --- 3. Merge PDF + XML matches ---
-        merged_matches = self.merge_pdf_xml_matches(pdf_matches, xml_matches)
+        # --- 3. Deduplicate combined matches (PDF + XML) ---
+        deduped_matches = self.deduplicate_matches(all_matches)
 
         # --- 4. Append to master results ---
-        self.master_results.extend(merged_matches)
-
-    
+        self.master_results.extend(deduped_matches)
+        
     def run_on_folder(self, pdf_folder: str, xml_folder: str) -> pd.DataFrame:
         """
         Run the dataset reference extraction pipeline on all files in given folders.
@@ -268,5 +290,3 @@ class DatasetReferenceExtractor:
         df.insert(0, 'row_id', range(len(df)))
 
         return df[['row_id', 'article_id', 'dataset_id', 'context']]
-
-                
