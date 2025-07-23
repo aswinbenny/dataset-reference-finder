@@ -20,7 +20,7 @@ class DatasetReferenceExtractor:
         """
         Initialize the extractor with dataset ID regex patterns and context size.
         """
-        self.regex_patterns = regex_patterns  # e.g., {'SAMN': r'\bSAMN\d+\b'}
+        self.regex_patterns = regex_patterns 
         self.context_window = context_window  # in words
         self.master_results = []  # collect all processed rows here
 
@@ -40,8 +40,10 @@ class DatasetReferenceExtractor:
         # 4. Remove unnecessary backslashes before quotes (like d\'Océanographie → d'Océanographie)
         text = re.sub(r'\\([\'"“”‘’`´])', r'\1', text)
 
-        # 5. Add space between glued lowercase-uppercase boundaries (e.g., datasetEuropean → dataset European)
-        text = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', text)
+        # # 5. Add space between glued lowercase-uppercase boundaries (e.g., datasetEuropean → dataset European)
+        # text = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', text)
+        # 5 Remove space after slashes or dots (e.g., 'doi.org/ 10' → 'doi.org/10')
+        text = re.sub(r'([/.])\s+', r'\1', text)
 
         # 6. Insert space before URLs (e.g., doihttps://... → doi https://...)
         text = re.sub(r'(?<=[a-zA-Z])(?=https?://)', ' ', text)
@@ -88,12 +90,13 @@ class DatasetReferenceExtractor:
         """
         Extract raw text from a PDF file.
         """
+        all_text = ""
         doc = fitz.open(pdf_path)
-        text = ""
         for page in doc:
-            text += page.get_text()
+            text = page.get_text()  # default = "text"
+            all_text += text + "\n"
         doc.close()
-        return self.clean_text(text)
+        return self.clean_text(all_text)
     
     def extract_contexts(self, text, article_id, source):
         """
@@ -122,9 +125,24 @@ class DatasetReferenceExtractor:
             index += len(tok)
 
         for pattern_type, pattern in self.regex_patterns.items():
+           
             for match in re.finditer(pattern, text):
                 raw_match = match.group()
-                cleaned_match = re.sub(r'\s+', '', raw_match)  # Remove inner spaces
+                cleaned_match = re.sub(r'\s+', '', raw_match)
+
+                # Normalize all DOI variants to 'https://doi.org/...' format
+                if pattern_type.startswith('doi'):
+                    # Extract the actual DOI string after 'doi:', 'doi.org/', or 'dx.doi.org/'
+                    doi_match = re.search(r'10\.\d{4,9}/[^\s)]+', cleaned_match)
+                    if doi_match:
+                        doi_value = doi_match.group()
+                        cleaned_match = f'https://doi.org/{doi_value}'.lower()
+
+                # Skip if DOI equals article's own DOI
+                normalized_article_doi = f"https://doi.org/{article_id.replace('_', '/')}"
+                if pattern_type.startswith('doi') and cleaned_match.lower() == normalized_article_doi.lower():
+                    continue
+
                 start_char = match.start()
 
                 if start_char in char_to_token:
@@ -140,11 +158,11 @@ class DatasetReferenceExtractor:
                         'article_id': article_id,
                         'source': source,
                         'start_idx': start_char,
-                        'score': None  # Filled later
+                        'score': None
                     })
 
         return matches
-        
+            
     def score_context(self, ctx: str) -> int:
         """
         Score the extracted context using keyword heuristics.
@@ -156,7 +174,8 @@ class DatasetReferenceExtractor:
         usage_keywords = [
             'used', 'generated', 'collected', 'curated', 'analyzed', 'assembled', 'created',
             'constructed', 'compiled', 'built', 'gathered', 'obtained', 'employed', 'leveraged',
-            'utilized', 'processed', 'performed on', 'applied to', 'mapped'
+            'utilized', 'processed', 'performed on', 'applied to', 'mapped', 'availability', 'dataset availability', 
+            'data availability', 'data availability statement', 'dataset availability statement'
         ]
 
         access_keywords = [
@@ -289,4 +308,4 @@ class DatasetReferenceExtractor:
         df = pd.DataFrame(self.master_results)
         df.insert(0, 'row_id', range(len(df)))
 
-        return df[['row_id', 'article_id', 'dataset_id', 'context']]
+        return df[['row_id', 'article_id', 'dataset_id', 'context', 'pattern_type', 'source', 'start_idx', 'score']]
